@@ -9,7 +9,7 @@ from brownie import chain  # type: ignore
 from eth_typing import ChecksumAddress
 from web3 import Web3
 
-from degenbot.constants import ZERO_ADDRESS
+from degenbot.constants import WRAPPED_NATIVE_TOKENS, ZERO_ADDRESS
 from degenbot.exceptions import (
     DegenbotError,
     EVMRevertError,
@@ -21,23 +21,20 @@ from degenbot.exceptions import (
 )
 from degenbot.logging import logger
 from degenbot.token import Erc20Token
+from degenbot.transaction.simulation_ledger import SimulationLedger
 from degenbot.types import TransactionHelper
-from degenbot.uniswap import (
+from degenbot.uniswap.abi import UNISWAP_V3_ROUTER2_ABI, UNISWAP_V3_ROUTER_ABI
+from degenbot.uniswap.uniswap_managers import (
     UniswapV2LiquidityPoolManager,
     UniswapV3LiquidityPoolManager,
 )
-from degenbot.uniswap.abi import UNISWAP_V3_ROUTER2_ABI, UNISWAP_V3_ROUTER_ABI
 from degenbot.uniswap.v2 import LiquidityPool
-from degenbot.uniswap.v2.liquidity_pool import (
-    UniswapV2PoolSimulationResult,
-    UniswapV2PoolState,
-)
+from degenbot.uniswap.v2.functions import get_v2_pools_from_token_path
+from degenbot.uniswap.v2.liquidity_pool import UniswapV2PoolSimulationResult
 from degenbot.uniswap.v3 import V3LiquidityPool
 from degenbot.uniswap.v3.functions import decode_v3_path
-from degenbot.uniswap.v3.v3_liquidity_pool import (
-    UniswapV3PoolSimulationResult,
-    UniswapV3PoolState,
-)
+from degenbot.uniswap.v3.v3_liquidity_pool import UniswapV3PoolSimulationResult
+
 
 # Internal dict of known router contracts by chain ID. Pre-populated with
 # mainnet addresses. New routers can be added by class method `add_router`
@@ -91,8 +88,6 @@ _ROUTERS: Dict[int, Dict[str, Dict]] = {
     }
 }
 
-# Internal dict of known wrapped token contracts by chain ID.
-_WRAPPED_NATIVE_TOKENS = {1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"}
 
 # see https://github.com/Uniswap/universal-router/blob/deployed-commit/contracts/libraries/Constants.sol
 _UNIVERSAL_ROUTER_CONTRACT_BALANCE_FLAG = 1 << 255
@@ -111,145 +106,60 @@ def _raise_if_expired(deadline: int):
         raise TransactionError("Deadline expired")
 
 
-def get_v2_pools_from_token_path(
-    tx_path,
-    pool_manager: UniswapV2LiquidityPoolManager,
-) -> List[LiquidityPool]:
-    return [
-        pool_manager.get_pool(
-            token_addresses=token_addresses,
-            silent=True,
-        )
-        for token_addresses in itertools.pairwise(tx_path)
-    ]
+def _show_v2_states(sim_result: UniswapV2PoolSimulationResult):
+    current_state = sim_result.current_state
+    future_state = sim_result.future_state
+    pool = current_state.pool
+
+    # amount out is negative
+    if sim_result.amount0_delta < sim_result.amount1_delta:
+        token_in = pool.token1
+        token_out = pool.token0
+        amount_in = sim_result.amount1_delta
+        amount_out = -sim_result.amount0_delta
+    else:
+        token_in = pool.token0
+        token_out = pool.token1
+        amount_in = sim_result.amount0_delta
+        amount_out = -sim_result.amount1_delta
+
+    logger.info(f"Simulating swap through pool: {pool}")
+    logger.info(f"\t{amount_in} {token_in} -> {amount_out} {token_out}")
+    logger.info("\t(CURRENT)")
+    logger.info(f"\t{pool.token0}: {current_state.reserves_token0}")
+    logger.info(f"\t{pool.token1}: {current_state.reserves_token1}")
+    logger.info(f"\t(FUTURE)")
+    logger.info(f"\t{pool.token0}: {future_state.reserves_token0}")
+    logger.info(f"\t{pool.token1}: {future_state.reserves_token1}")
 
 
-class SimulationLedger:
-    """
-    A dictionary-like class for tracking token balances across a set of
-    addresses.
-    """
+def _show_v3_states(sim_result: UniswapV3PoolSimulationResult):
+    current_state = sim_result.current_state
+    future_state = sim_result.future_state
+    pool = current_state.pool
 
-    def __init__(self):
-        # entries are recorded as a dict-of-dicts, keyed by address, then by token address
-        self._balances: Dict[
-            ChecksumAddress,  # address holding balance
-            Dict[
-                ChecksumAddress,  # token address
-                int,  # balance
-            ],
-        ] = dict()
+    # amount out is negative
+    if sim_result.amount0_delta < sim_result.amount1_delta:
+        token_in = pool.token1
+        token_out = pool.token0
+        amount_in = sim_result.amount1_delta
+        amount_out = -sim_result.amount0_delta
+    else:
+        token_in = pool.token0
+        token_out = pool.token1
+        amount_in = sim_result.amount0_delta
+        amount_out = -sim_result.amount1_delta
 
-    def adjust(
-        self,
-        address: Union[str, ChecksumAddress],
-        token: Union[Erc20Token, str, ChecksumAddress],
-        amount: int,
-    ) -> None:
-        """
-        Modify the balance for a given address and token.
-
-        The amount can be positive (credit) or negative (debit).
-
-        The method checksums all addresses.
-        """
-
-        _token_address: ChecksumAddress
-        if isinstance(token, Erc20Token):
-            _token_address = token.address
-        elif isinstance(token, str):
-            _token_address = Web3.toChecksumAddress(token)
-        elif isinstance(token, ChecksumAddress):
-            _token_address = token
-        else:
-            raise ValueError(
-                f"Expected token type Erc20Token, str, or ChecksumAddress. Was {type(token)}"
-            )
-
-        _address = Web3.toChecksumAddress(address)
-
-        address_balance: Dict[ChecksumAddress, int]
-        try:
-            address_balance = self._balances[_address]
-        except KeyError:
-            address_balance = {}
-            self._balances[_address] = address_balance
-
-        logger.debug(
-            f"BALANCE: {_address} {'+' if amount > 0 else ''}{amount} {_token_address}"
-        )
-
-        try:
-            address_balance[_token_address]
-        except KeyError:
-            address_balance[_token_address] = 0
-        finally:
-            address_balance[_token_address] += amount
-            if address_balance[_token_address] == 0:
-                del address_balance[_token_address]
-            if not address_balance:
-                del self._balances[_address]
-
-    def token_balance(
-        self,
-        address: Union[str, ChecksumAddress],
-        token: Union[Erc20Token, str, ChecksumAddress],
-    ) -> int:
-        """
-        Get the balance for a given address and token.
-
-        The method checksums all addresses.
-        """
-
-        _address = Web3.toChecksumAddress(address)
-
-        if isinstance(token, Erc20Token):
-            _token_address = token.address
-        elif isinstance(token, str):
-            _token_address = Web3.toChecksumAddress(token)
-        elif isinstance(token, ChecksumAddress):
-            _token_address = token
-        else:
-            raise ValueError(
-                f"Expected token type Erc20Token, str, or ChecksumAddress. Was {type(token)}"
-            )
-
-        address_balances: Dict[ChecksumAddress, int]
-        try:
-            address_balances = self._balances[_address]
-        except KeyError:
-            address_balances = {}
-
-        return address_balances.get(_token_address, 0)
-
-    def transfer(
-        self,
-        token: Union[Erc20Token, str, ChecksumAddress],
-        amount: int,
-        from_addr: Union[ChecksumAddress, str],
-        to_addr: Union[ChecksumAddress, str],
-    ) -> None:
-        if isinstance(token, Erc20Token):
-            _token_address = token.address
-        elif isinstance(token, str):
-            _token_address = Web3.toChecksumAddress(token)
-        elif isinstance(token, ChecksumAddress):
-            _token_address = token
-        else:
-            raise ValueError(
-                f"Expected token type Erc20Token, str, or ChecksumAddress. Was {type(token)}"
-            )
-
-        self.adjust(
-            address=from_addr,
-            token=_token_address,
-            amount=-amount,
-        )
-        self.adjust(
-            address=to_addr,
-            token=_token_address,
-            amount=amount,
-        )
+    logger.info(f"Simulated output of swap through pool: {pool}")
+    logger.info(f"\t{amount_in} {token_in} -> {amount_out} {token_out}")
+    logger.info("\t(CURRENT)")
+    logger.info(f"\tprice={current_state.sqrt_price_x96}")
+    logger.info(f"\tliquidity={current_state.liquidity}")
+    logger.info(f"\ttick={current_state.tick}")
+    logger.info(f"\t(FUTURE)")
+    logger.info(f"\tprice={future_state.sqrt_price_x96}")
+    logger.info(f"\tliquidity={future_state.liquidity}")
+    logger.info(f"\ttick={future_state.tick}")
 
 
 class UniswapTransaction(TransactionHelper):
@@ -301,12 +211,12 @@ class UniswapTransaction(TransactionHelper):
         _token_address = Web3.toChecksumAddress(token_address)
 
         try:
-            _WRAPPED_NATIVE_TOKENS[chain_id]
+            WRAPPED_NATIVE_TOKENS[chain_id]
         except KeyError:
-            _WRAPPED_NATIVE_TOKENS[chain_id] = _token_address
+            WRAPPED_NATIVE_TOKENS[chain_id] = _token_address
         else:
             raise ValueError(
-                f"Token address {_WRAPPED_NATIVE_TOKENS[chain_id]} already set for chain ID {chain_id}!"
+                f"Token address {WRAPPED_NATIVE_TOKENS[chain_id]} already set for chain ID {chain_id}!"
             )
 
     def __init__(
@@ -344,6 +254,7 @@ class UniswapTransaction(TransactionHelper):
         # specified amount at the time the transaction is built. The ledger is
         # used to look up the balance at any point inside the swap, and at the
         # end to confirm that all balances have been accounted for.
+
         self.ledger = SimulationLedger()
 
         self.chain_id = (
@@ -414,6 +325,20 @@ class UniswapTransaction(TransactionHelper):
 
         current_state = pool.state
 
+        if (
+            amount_in == _UNIVERSAL_ROUTER_CONTRACT_BALANCE_FLAG
+            or amount_in == _V3_ROUTER2_CONTRACT_BALANCE_FLAG
+        ):
+            _balance = self.ledger.token_balance(self.router_address, token_in)
+
+            self.ledger.transfer(
+                token=token_in,
+                amount=_balance,
+                to_addr=pool.address,
+                from_addr=self.router_address,
+            )
+            amount_in = self.ledger.token_balance(pool.address, token_in)
+
         sim_result = pool.simulate_swap(
             token_in=token_in,
             token_in_quantity=amount_in,
@@ -428,20 +353,6 @@ class UniswapTransaction(TransactionHelper):
             sim_result.amount0_delta,
             sim_result.amount1_delta,
         )
-
-        if (
-            amount_in == _UNIVERSAL_ROUTER_CONTRACT_BALANCE_FLAG
-            or amount_in == _V3_ROUTER2_CONTRACT_BALANCE_FLAG
-        ):
-            _balance = self.ledger.token_balance(self.router_address, token_in)
-
-            self.ledger.transfer(
-                token=token_in,
-                amount=_balance,
-                to_addr=pool.address,
-                from_addr=self.router_address,
-            )
-            amount_in = self.ledger.token_balance(pool.address, token_in)
 
         if first_swap and not self.ledger.token_balance(
             pool.address, token_in
@@ -473,18 +384,6 @@ class UniswapTransaction(TransactionHelper):
         if last_swap:
             self.to.add(Web3.toChecksumAddress(recipient))
 
-        if not silent:
-            logger.info(f"Simulating swap through pool: {pool}")
-            logger.info(
-                f"\t{amount_in} {token_in} -> {_amount_out} {token_out}"
-            )
-            logger.info("\t(CURRENT)")
-            logger.info(f"\t{pool.token0}: {current_state.reserves_token0}")
-            logger.info(f"\t{pool.token1}: {current_state.reserves_token1}")
-            logger.info(f"\t(FUTURE)")
-            logger.info(f"\t{pool.token0}: {future_state.reserves_token0}")
-            logger.info(f"\t{pool.token1}: {future_state.reserves_token1}")
-
         if (
             last_swap
             and amount_out_min is not None
@@ -493,6 +392,9 @@ class UniswapTransaction(TransactionHelper):
             raise TransactionError(
                 f"Insufficient output for swap! {_amount_out} {token_out} received, {amount_out_min} required"
             )
+
+        if not silent:
+            _show_v2_states(sim_result)
 
         return pool, sim_result
 
@@ -553,18 +455,6 @@ class UniswapTransaction(TransactionHelper):
         else:
             _recipient = Web3.toChecksumAddress(recipient)
 
-        if not silent:
-            logger.info(f"Simulating swap through pool: {pool}")
-            logger.info(
-                f"\t{_amount_in} {token_in} -> {amount_out} {token_out}"
-            )
-            logger.info("\t(CURRENT)")
-            logger.info(f"\t{pool.token0}: {current_state.reserves_token0}")
-            logger.info(f"\t{pool.token1}: {current_state.reserves_token1}")
-            logger.info(f"\t(FUTURE)")
-            logger.info(f"\t{pool.token0}: {future_state.reserves_token0}")
-            logger.info(f"\t{pool.token1}: {future_state.reserves_token1}")
-
         # process the swap
         self.ledger.adjust(pool.address, token_in.address, -_amount_in)
         self.ledger.adjust(pool.address, token_out.address, amount_out)
@@ -585,6 +475,9 @@ class UniswapTransaction(TransactionHelper):
             raise TransactionError(
                 f"Required input {_amount_in} exceeds maximum {amount_in_max}"
             )
+
+        if not silent:
+            _show_v2_states(sim_result)
 
         return pool, sim_result
 
@@ -672,24 +565,13 @@ class UniswapTransaction(TransactionHelper):
             _amount_out,
         )
 
-        if not silent:
-            logger.info(f"Simulated output of swap through pool: {pool}")
-            logger.info(
-                f"\t{amount_in} {token_in} -> {_amount_out} {token_out}"
-            )
-            logger.info("\t(CURRENT)")
-            logger.info(f"\tprice={_current_pool_state.sqrt_price_x96}")
-            logger.info(f"\tliquidity={_current_pool_state.liquidity}")
-            logger.info(f"\ttick={_current_pool_state.tick}")
-            logger.info(f"\t(FUTURE)")
-            logger.info(f"\tprice={_future_pool_state.sqrt_price_x96}")
-            logger.info(f"\tliquidity={_future_pool_state.liquidity}")
-            logger.info(f"\ttick={_future_pool_state.tick}")
-
         if amount_out_min is not None and _amount_out < amount_out_min:
             raise TransactionError(
                 f"Insufficient output for swap! {_amount_out} {token_out} received, {amount_out_min} required"
             )
+
+        if not silent:
+            _show_v3_states(_sim_result)
 
         return pool, _sim_result
 
@@ -807,18 +689,7 @@ class UniswapTransaction(TransactionHelper):
             )
 
         if not silent:
-            logger.info(f"Simulated output of swap through pool: {pool}")
-            logger.info(
-                f"\t{_amount_in} {token_in} -> {_amount_out} {token_out}"
-            )
-            logger.info("\t(CURRENT)")
-            logger.info(f"\tprice={_current_pool_state.sqrt_price_x96}")
-            logger.info(f"\tliquidity={_current_pool_state.liquidity}")
-            logger.info(f"\ttick={_current_pool_state.tick}")
-            logger.info(f"\t(FUTURE)")
-            logger.info(f"\tprice={_future_pool_state.sqrt_price_x96}")
-            logger.info(f"\tliquidity={_future_pool_state.liquidity}")
-            logger.info(f"\ttick={_future_pool_state.tick}")
+            _show_v3_states(_sim_result)
 
         return pool, _sim_result
 
@@ -1027,12 +898,6 @@ class UniswapTransaction(TransactionHelper):
                     UniswapV2PoolSimulationResult,
                     UniswapV3PoolSimulationResult,
                 ]
-                _current_pool_state: Union[
-                    UniswapV2PoolState, UniswapV3PoolState
-                ]
-                _future_pool_state: Union[
-                    UniswapV2PoolState, UniswapV3PoolState
-                ]
 
             _universal_router_command_future_pool_states: List[
                 Union[
@@ -1138,7 +1003,7 @@ class UniswapTransaction(TransactionHelper):
                 else:
                     _recipient = tx_recipient
 
-                _wrapped_token_address = _WRAPPED_NATIVE_TOKENS[self.chain_id]
+                _wrapped_token_address = WRAPPED_NATIVE_TOKENS[self.chain_id]
 
                 self.ledger.adjust(
                     _recipient,
@@ -1163,7 +1028,7 @@ class UniswapTransaction(TransactionHelper):
                 except:
                     raise ValueError(f"Could not decode input for {command}")
 
-                _wrapped_token_address = _WRAPPED_NATIVE_TOKENS[self.chain_id]
+                _wrapped_token_address = WRAPPED_NATIVE_TOKENS[self.chain_id]
                 _wrapped_token_balance = self.ledger.token_balance(
                     self.router_address, _wrapped_token_address
                 )
@@ -1252,11 +1117,6 @@ class UniswapTransaction(TransactionHelper):
                         last_swap=last_swap,
                     )
 
-                    if TYPE_CHECKING:
-                        assert isinstance(
-                            _future_pool_state, UniswapV2PoolState
-                        )
-
                     _amount_out = -min(
                         _sim_result.amount0_delta, _sim_result.amount1_delta
                     )
@@ -1337,8 +1197,6 @@ class UniswapTransaction(TransactionHelper):
                         if pool.token0 == tx_path[-2 - pool_pos]
                         else pool.token1
                     )
-
-                    _current_pool_state = pool.state
 
                     _, _sim_result = self._simulate_v2_swap_exact_out(
                         pool=pool,
@@ -2268,7 +2126,7 @@ class UniswapTransaction(TransactionHelper):
                     # TODO: if ETH balances are ever needed, handle the
                     # ETH transfer resulting from this function
                     amountMin = func_params["amountMinimum"]
-                    wrapped_token_address = _WRAPPED_NATIVE_TOKENS[
+                    wrapped_token_address = WRAPPED_NATIVE_TOKENS[
                         self.chain_id
                     ]
                     wrapped_token_balance = self.ledger.token_balance(
@@ -2289,7 +2147,7 @@ class UniswapTransaction(TransactionHelper):
                     _fee_bips = func_params["feeBips"]
                     _fee_recipient = func_params["feeRecipient"]
 
-                    wrapped_token_address = _WRAPPED_NATIVE_TOKENS[
+                    wrapped_token_address = WRAPPED_NATIVE_TOKENS[
                         self.chain_id
                     ]
                     wrapped_token_balance = self.ledger.token_balance(
@@ -2333,7 +2191,7 @@ class UniswapTransaction(TransactionHelper):
 
                 elif func_name == "wrapETH":
                     _wrapped_token_amount = func_params["value"]
-                    _wrapped_token_address = _WRAPPED_NATIVE_TOKENS[
+                    _wrapped_token_address = WRAPPED_NATIVE_TOKENS[
                         self.chain_id
                     ]
                     self.ledger.adjust(

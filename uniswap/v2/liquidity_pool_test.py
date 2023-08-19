@@ -1,6 +1,7 @@
 from fractions import Fraction
 
 import pytest
+import web3
 
 from degenbot import Erc20Token, LiquidityPool
 from degenbot.exceptions import ZeroSwapError
@@ -29,21 +30,29 @@ class MockLiquidityPool(LiquidityPool):
 
 
 token0 = MockErc20Token()
-token0.address = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+token0.address = web3.Web3.toChecksumAddress(
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+)
 token0.decimals = 8
 token0.name = "Wrapped BTC"
 token0.symbol = "WBTC"
 
 token1 = MockErc20Token()
-token1.address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+token1.address = web3.Web3.toChecksumAddress(
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+)
 token1.decimals = 18
 token1.name = "Wrapped Ether"
 token1.symbol = "WETH"
 
 lp = MockLiquidityPool()
 lp.name = "WBTC-WETH (V2, 0.30%)"
-lp.address = "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
-lp.factory = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+lp.address = web3.Web3.toChecksumAddress(
+    "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
+)
+lp.factory = web3.Web3.toChecksumAddress(
+    "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+)
 lp.fee = None
 lp.fee_token0 = Fraction(3, 1000)
 lp.fee_token1 = Fraction(3, 1000)
@@ -79,6 +88,7 @@ def test_calculate_tokens_out_from_tokens_in_with_override():
     # token1 reserves: 2602647332090181827846
 
     pool_state_override = UniswapV2PoolState(
+        pool=lp,
         reserves_token0=16027096956,
         reserves_token1=2602647332090181827846,
     )
@@ -91,6 +101,17 @@ def test_calculate_tokens_out_from_tokens_in_with_override():
         )
         == 864834865217768537471
     )
+
+    with pytest.raises(
+        ValueError,
+        match="Must provide reserve override values for both tokens",
+    ):
+        lp.calculate_tokens_out_from_tokens_in(
+            token_in=lp.token0,
+            token_in_quantity=8000000000,
+            override_reserves_token0=0,
+            override_reserves_token1=10,
+        )
 
 
 def test_calculate_tokens_in_from_tokens_out():
@@ -119,6 +140,7 @@ def test_calculate_tokens_in_from_tokens_out_with_override():
     # token1 reserves: 2602647332090181827846
 
     pool_state_override = UniswapV2PoolState(
+        pool=lp,
         reserves_token0=16027096956,
         reserves_token1=2602647332090181827846,
     )
@@ -132,13 +154,27 @@ def test_calculate_tokens_in_from_tokens_out_with_override():
         == 13752842264
     )
 
+    with pytest.raises(
+        ValueError,
+        match="Must provide reserve override values for both tokens",
+    ):
+        lp.calculate_tokens_in_from_tokens_out(
+            token_in=lp.token0,
+            token_out_quantity=1200000000000000000000,
+            override_reserves_token0=0,
+            override_reserves_token1=10,
+        )
+
 
 def test_comparisons():
     assert lp == "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
+    assert lp == "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940".lower()
 
     other_lp = MockLiquidityPool()
     other_lp.name = "WBTC-WETH (V2, 0.30%)"
-    other_lp.address = "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
+    other_lp.address = web3.Web3.toChecksumAddress(
+        "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"
+    )
 
     assert lp == other_lp
 
@@ -155,6 +191,7 @@ def test_simulations():
         amount1_delta=-847228560678214929944,
         current_state=lp.state,
         future_state=UniswapV2PoolState(
+            pool=lp,
             reserves_token0=lp.reserves_token0 + 8000000000,
             reserves_token1=lp.reserves_token1 - 847228560678214929944,
         ),
@@ -181,6 +218,7 @@ def test_simulations():
         amount1_delta=1200000000000000000000,
         current_state=lp.state,
         future_state=UniswapV2PoolState(
+            pool=lp,
             reserves_token0=lp.reserves_token0 - 5154005339,
             reserves_token1=lp.reserves_token1 + 1200000000000000000000,
         ),
@@ -209,12 +247,14 @@ def test_simulations_with_override():
         amount1_delta=-864834865217768537471,
         current_state=lp.state,
         future_state=UniswapV2PoolState(
+            pool=lp,
             reserves_token0=lp.reserves_token0 + 8000000000,
             reserves_token1=lp.reserves_token1 - 864834865217768537471,
         ),
     )
 
     pool_state_override = UniswapV2PoolState(
+        pool=lp,
         reserves_token0=16027096956,
         reserves_token1=2602647332090181827846,
     )
@@ -233,6 +273,7 @@ def test_simulations_with_override():
         amount1_delta=-1200000000000000000000,
         current_state=lp.state,
         future_state=UniswapV2PoolState(
+            pool=lp,
             reserves_token0=lp.reserves_token0 + 13752842264,
             reserves_token1=lp.reserves_token1 - 1200000000000000000000,
         ),

@@ -1,14 +1,17 @@
 import pytest
+import web3
 
 from degenbot import Erc20Token
-from degenbot.exceptions import LiquidityPoolError
+from degenbot.exceptions import LiquidityPoolError, ExternalUpdateError
 from degenbot.uniswap.v3.v3_liquidity_pool import (
     UniswapV3BitmapAtWord,
     UniswapV3LiquidityAtTick,
     UniswapV3PoolSimulationResult,
     UniswapV3PoolState,
+    UniswapV3PoolExternalUpdate,
     V3LiquidityPool,
 )
+from threading import Lock
 
 
 class MockErc20Token(Erc20Token):
@@ -30,26 +33,37 @@ class MockV3LiquidityPool(V3LiquidityPool):
 # Reserve values taken at block height 17,600,000
 
 token0 = MockErc20Token()
-token0.address = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+token0.address = web3.Web3.toChecksumAddress(
+    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+)
 token0.decimals = 8
 token0.name = "Wrapped BTC"
 token0.symbol = "WBTC"
 
 token1 = MockErc20Token()
-token1.address = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+token1.address = web3.Web3.toChecksumAddress(
+    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+)
 token1.decimals = 18
 token1.name = "Wrapped Ether"
 token1.symbol = "WETH"
 
 lp = MockV3LiquidityPool()
 lp.name = "WBTC-WETH (V3, 0.30%)"
-lp.address = "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD"
-lp.factory = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+lp._slot0_lock = Lock()
+lp._liquidity_lock = Lock()
+lp.address = web3.Web3.toChecksumAddress(
+    "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD"
+)
+lp.factory = web3.Web3.toChecksumAddress(
+    "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+)
 lp.fee = 3000
 lp.token0 = token0
 lp.token1 = token1
 lp.liquidity = 1612978974357835825
 lp.liquidity_update_block = 1
+lp.update_block = 1
 lp.sqrt_price_x96 = 31549217861118002279483878013792428
 lp.sparse_bitmap = False
 lp.tick = 257907
@@ -2049,6 +2063,91 @@ lp.tick_data = {
 lp._update_pool_state()
 
 
+def test_tick_bitmap_equality():
+    with pytest.raises(AssertionError):
+        assert UniswapV3BitmapAtWord(bitmap=1) == UniswapV3BitmapAtWord(
+            bitmap=2
+        )
+
+    # `block` field is set with `compare=False`, so that only the bitmap is
+    # considered by equality checks
+    assert UniswapV3BitmapAtWord(bitmap=1, block=1) == UniswapV3BitmapAtWord(
+        bitmap=1, block=2
+    )
+
+
+def test_tick_data_equality():
+    with pytest.raises(AssertionError):
+        assert UniswapV3LiquidityAtTick(
+            liquidityNet=1, liquidityGross=2
+        ) == UniswapV3LiquidityAtTick(liquidityNet=3, liquidityGross=4)
+
+    # `block` field is set with `compare=False`, so that only the liquidity is
+    # considered by equality checks
+    assert UniswapV3LiquidityAtTick(
+        liquidityNet=1, liquidityGross=2, block=3
+    ) == UniswapV3LiquidityAtTick(liquidityNet=1, liquidityGross=2, block=4)
+
+
+def test_pool_state_equality():
+    with pytest.raises(AssertionError):
+        assert UniswapV3PoolState(
+            pool=lp,
+            liquidity=10 * 10**18,
+            sqrt_price_x96=10 * 10**18,
+            tick=69_420,
+        ) == UniswapV3PoolState(
+            pool=lp,
+            liquidity=10 * 10**18,
+            sqrt_price_x96=10 * 10**18,
+            tick=69_421,
+        )
+
+    with pytest.raises(AssertionError):
+        assert UniswapV3PoolState(
+            pool=lp,
+            liquidity=10 * 10**18,
+            sqrt_price_x96=10 * 10**18,
+            tick=69_420,
+        ) == UniswapV3PoolState(
+            pool=lp,
+            liquidity=10 * 10**18,
+            sqrt_price_x96=11 * 10**18,
+            tick=69_420,
+        )
+
+    with pytest.raises(AssertionError):
+        assert UniswapV3PoolState(
+            pool=lp,
+            liquidity=10 * 10**18,
+            sqrt_price_x96=10 * 10**18,
+            tick=69_420,
+        ) == UniswapV3PoolState(
+            pool=lp,
+            liquidity=11 * 10**18,
+            sqrt_price_x96=10 * 10**18,
+            tick=69_420,
+        )
+
+    # `tick_bitmap` and `tick_data` fields are set with `compare=False`, so
+    # that only the liquidity, price, and tick are considered by equality checks
+    assert UniswapV3PoolState(
+        pool=lp,
+        liquidity=10 * 10**18,
+        sqrt_price_x96=10 * 10**18,
+        tick=69_420,
+        tick_bitmap={"a": "b"},
+        tick_data={"c": "d"},
+    ) == UniswapV3PoolState(
+        pool=lp,
+        liquidity=10 * 10**18,
+        sqrt_price_x96=10 * 10**18,
+        tick=69_420,
+        tick_bitmap={"e": "f"},
+        tick_data={"g": "h"},
+    )
+
+
 def test_calculate_tokens_out_from_tokens_in():
     assert (
         lp.calculate_tokens_out_from_tokens_in(
@@ -2073,6 +2172,7 @@ def test_calculate_tokens_out_from_tokens_in_with_override():
     # Tick: 258116
 
     pool_state_override = UniswapV3PoolState(
+        pool=lp,
         liquidity=1533143241938066251,
         sqrt_price_x96=31881290961944305252140777263703426,
         tick=258116,
@@ -2113,6 +2213,7 @@ def test_calculate_tokens_in_from_tokens_out_with_override():
     # Tick: 258116
 
     pool_state_override = UniswapV3PoolState(
+        pool=lp,
         liquidity=1533143241938066251,
         sqrt_price_x96=31881290961944305252140777263703426,
         tick=258116,
@@ -2137,6 +2238,7 @@ def test_simulations():
         amount1_delta=1000000000000000000,
         current_state=lp.state,
         future_state=UniswapV3PoolState(
+            pool=lp,
             liquidity=1612978974357835825,
             sqrt_price_x96=31549266832914462409708360853542079,
             tick=257907,
@@ -2167,6 +2269,7 @@ def test_simulations():
         amount1_delta=-15808930695950518795,
         current_state=lp.state,
         future_state=UniswapV3PoolState(
+            pool=lp,
             liquidity=1612978974357835825,
             sqrt_price_x96=31548441339817807300885591332345643,
             tick=257906,
@@ -2197,6 +2300,7 @@ def test_simulations_with_override():
     # Tick: 258116
 
     pool_state_override = UniswapV3PoolState(
+        pool=lp,
         liquidity=1533143241938066251,
         sqrt_price_x96=31881290961944305252140777263703426,
         tick=258116,
@@ -2211,6 +2315,7 @@ def test_simulations_with_override():
         amount1_delta=1 * 10**18,
         current_state=lp.state,
         future_state=UniswapV3PoolState(
+            pool=lp,
             sqrt_price_x96=31881342483860761583159860586051776,
             liquidity=1533143241938066251,
             tick=258116,
@@ -2226,6 +2331,7 @@ def test_simulations_with_override():
         amount1_delta=999999892383362636,
         current_state=lp.state,
         future_state=UniswapV3PoolState(
+            pool=lp,
             sqrt_price_x96=31881342483855216967760245337454994,
             liquidity=1533143241938066251,
             tick=258116,
@@ -2271,3 +2377,69 @@ def test_swap_for_all():
         )
         == 2989455025796272434286933989528647
     )
+
+
+def test_external_updates():
+    lp.external_update(
+        update=UniswapV3PoolExternalUpdate(
+            block_number=2,
+            liquidity=69,
+        ),
+    )
+    assert lp.liquidity_update_block == 1 and lp.update_block == 2
+
+    new_liquidity = 10_000_000_000
+
+    lp.external_update(
+        update=UniswapV3PoolExternalUpdate(
+            block_number=2,
+            liquidity_change=(new_liquidity, -887160, -887220),
+        ),
+    )
+
+    # New liquidity is added to liquidityNet at lower tick, subtracted from upper tick.
+    assert lp.tick_data[-887160].liquidityNet == 80064092962998 + new_liquidity
+    assert lp.tick_data[-887220].liquidityNet == 82174936226787 - new_liquidity
+
+    # New liquidity is added to liquidityGross on both sides.
+    assert (
+        lp.tick_data[-887160].liquidityGross == 80064092962998 + new_liquidity
+    )
+    assert (
+        lp.tick_data[-887220].liquidityGross == 82174936226787 + new_liquidity
+    )
+
+    # Try an update for a past block
+    with pytest.raises(ExternalUpdateError):
+        lp.external_update(
+            update=UniswapV3PoolExternalUpdate(
+                block_number=1,
+                liquidity=10,
+            ),
+        )
+
+    # Update the liquidity and then submit a liquidity change for the previous block
+    # which is valid, but the in-range liquidity should not have been changed
+    # NOTE: tick = 257907
+    lp.external_update(
+        update=UniswapV3PoolExternalUpdate(
+            block_number=10,
+            liquidity=69_420_000,
+        ),
+    )
+    lp.external_update(
+        update=UniswapV3PoolExternalUpdate(
+            block_number=3,
+            liquidity_change=(1, 257880, 257940),
+        ),
+    )
+    assert lp.liquidity == 69_420_000
+
+    # Now repeat the liquidity change for a newer block and check that the in-range liquidity was adjusted
+    lp.external_update(
+        update=UniswapV3PoolExternalUpdate(
+            block_number=11,
+            liquidity_change=(1, 257880, 257940),
+        ),
+    )
+    assert lp.liquidity == 69_420_000 + 1

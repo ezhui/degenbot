@@ -15,16 +15,15 @@ from degenbot.exceptions import (
     ZeroSwapError,
 )
 from degenbot.logging import logger
-from degenbot.manager import AllPools, Erc20TokenHelperManager
 from degenbot.token import Erc20Token
 from degenbot.types import PoolHelper
 from degenbot.uniswap.abi import CAMELOT_POOL_ABI, UNISWAP_V2_POOL_ABI
-from degenbot.uniswap.v2.functions import generate_v2_pool_address
 from degenbot.uniswap.v2.router import Router
 
 
 @dataclasses.dataclass(slots=True)
 class UniswapV2PoolState:
+    pool: "LiquidityPool"
     reserves_token0: int
     reserves_token1: int
 
@@ -33,7 +32,6 @@ class UniswapV2PoolState:
 class UniswapV2PoolSimulationResult:
     amount0_delta: int
     amount1_delta: int
-    # WIP: store current and future states inside the simulation result
     current_state: UniswapV2PoolState
     future_state: UniswapV2PoolState
 
@@ -60,9 +58,11 @@ class LiquidityPool(PoolHelper):
         silent: bool = False,
         update_reserves_on_start: bool = True,
         unload_brownie_contract_after_init: bool = False,
+        state_block: Optional[int] = None,
     ) -> None:
         """
-        Create a new `LiquidityPool` object for interaction with a Uniswap V2 pool.
+        Create a new `LiquidityPool` object for interaction with a Uniswap
+        V2 pool.
 
         Arguments
         ---------
@@ -73,29 +73,45 @@ class LiquidityPool(PoolHelper):
         name : str, optional
             Name of the contract, e.g. "DAI-WETH".
         update_method : str
-            A string that sets the method used to fetch updates to the pool. Can be "polling", which fetches updates from the chain object using the contract object, or "external" which relies on updates being provided from outside the object.
+            A string that sets the method used to fetch updates to the pool.
+            Can be "polling", which fetches updates from the chain object
+            using the contract object, or "external" which relies on updates
+            being provided from outside the object.
         router : Router, optional
-            A reference to a Router object, which can be used to execute swaps using the attributes held within this object.
+            A reference to a Router object, which can be used to execute swaps
+            using the attributes held within this object.
         abi : list, optional
             Contract ABI.
         factory_address : str, optional
-            The address for the factory contract. The default assumes a mainnet Uniswap V2 factory contract.
-            If creating a `LiquidityPool` object based on another ecosystem, provide this value or the address check will fail.
+            The address for the factory contract. The default assumes a
+            mainnet Uniswap V2 factory contract. If creating a
+            `LiquidityPool` object based on another ecosystem, provide this
+            value or the address check will fail.
         factory_init_hash : str, optional
-            The init hash for the factory contract. The default assumes a mainnet Uniswap V2 factory contract.
+            The init hash for the factory contract. The default assumes a
+            mainnet Uniswap V2 factory contract.
         fee : Fraction
-            The swap fee imposed by the pool. Defaults to `Fraction(3,1000)` which is equivalent to 0.3%.
+            The swap fee imposed by the pool. Defaults to `Fraction(3,1000)`
+            which is equivalent to 0.3%.
         fee_token0 : Fraction, optional
-            Swap fee for token0. Same purpose as `fee` except useful for pools with different fees for each token.
+            Swap fee for token0. Same purpose as `fee` except useful for
+            pools with different fees for each token.
         fee_token1 : Fraction, optional
-            Swap fee for token1. Same purpose as `fee` except useful for pools with different fees for each token.
+            Swap fee for token1. Same purpose as `fee` except useful for
+            pools with different fees for each token.
         silent : bool
             Suppress status output.
         update_reserves_on_start : bool
             Update the reserves during instantiation.
         unload_brownie_contract_after_init : bool
-            Remove the Brownie contract helper before completion. Saves memory for objects that are externally-updated, and do not need to perform calls to the chain after creation.
+            Remove the Brownie contract helper before completion. Saves
+            memory for objects that are externally-updated, and do not
+            need to perform calls to the chain after creation.
+        state_block: int, optional
+            Fetch initial state values from the chain at a particular block
+            height. Defaults to the latest block if omitted.
         """
+
         self.uniswap_version = 2
 
         self.address: ChecksumAddress = Web3.toChecksumAddress(address)
@@ -135,7 +151,7 @@ class LiquidityPool(PoolHelper):
         self.token0_max_swap = 0
         self.token1_max_swap = 0
         self.new_reserves = False
-        self.update_block = chain.height
+        self.update_block = state_block if state_block else chain.height
 
         if abi is None:
             abi = UNISWAP_V2_POOL_ABI
@@ -162,6 +178,8 @@ class LiquidityPool(PoolHelper):
                 else:
                     raise ValueError(f"{token} not found in pool {self}")
         else:
+            from degenbot.manager import Erc20TokenHelperManager
+
             _token_manager = Erc20TokenHelperManager(chain.id)
             self.token0 = _token_manager.get_erc20token(
                 address=self._brownie_contract.token0(),
@@ -177,6 +195,8 @@ class LiquidityPool(PoolHelper):
             )
 
         if factory_address is not None and factory_init_hash is not None:
+            from degenbot.uniswap.v2.functions import generate_v2_pool_address
+
             computed_pool_address = generate_v2_pool_address(
                 token_addresses=[self.token0.address, self.token1.address],
                 factory_address=factory_address,
@@ -227,9 +247,12 @@ class LiquidityPool(PoolHelper):
             self._brownie_contract = None
 
         self.state = UniswapV2PoolState(
+            pool=self,
             reserves_token0=self.reserves_token0,
             reserves_token1=self.reserves_token1,
         )
+
+        from degenbot.manager import AllPools
 
         AllPools(chain.id)[self.address] = self
 
@@ -252,9 +275,13 @@ class LiquidityPool(PoolHelper):
 
     # The Brownie contract object cannot be pickled, so remove it and return the state
     def __getstate__(self):
+        keys_to_remove = [
+            "_brownie_contract",
+        ]
         state = self.__dict__.copy()
-        if self._brownie_contract is not None:
-            state["_brownie_contract"] = None
+        for key in keys_to_remove:
+            if key in state:
+                del state[key]
         return state
 
     def __hash__(self):
@@ -264,13 +291,14 @@ class LiquidityPool(PoolHelper):
         return f"LiquidityPool(address={self.address}, token0={self.token0}, token1={self.token1})"
 
     def __setstate__(self, state):
-        self.__dict__.update(state)
+        self.__dict__ = state
 
     def __str__(self):
         return self.name
 
     def _update_pool_state(self):
         self.state = UniswapV2PoolState(
+            pool=self,
             reserves_token0=self.reserves_token0,
             reserves_token1=self.reserves_token1,
         )
@@ -312,8 +340,15 @@ class LiquidityPool(PoolHelper):
         override_state: Optional[UniswapV2PoolState] = None,
     ) -> int:
         """
-        Calculates the required token INPUT of token_in for a target OUTPUT at current pool reserves.
-        Uses the self.token0 and self.token1 pointers to determine which token is being swapped in
+        Calculates the required token INPUT of token_in for a target OUTPUT
+        at current pool reserves. Uses the `self.token0` and `self.token1`
+        references to determine which token is being swapped in.
+
+        @dev This method accepts overrides in the form of individual tokens
+        reserves or a single override dictionary. The override dictionary is
+        used by other helpers and is the preferred method. The individual
+        overrides are left here for backward compatibility with older scripts,
+        and will be deprecated in the future.
         """
 
         if override_state:
@@ -624,6 +659,7 @@ class LiquidityPool(PoolHelper):
             amount1_delta=token1_delta,
             current_state=self.state,
             future_state=UniswapV2PoolState(
+                pool=self,
                 reserves_token0=self.reserves_token0 + token0_delta,
                 reserves_token1=self.reserves_token1 + token1_delta,
             ),
